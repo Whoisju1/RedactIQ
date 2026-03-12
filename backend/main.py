@@ -2,7 +2,7 @@ import os
 import shutil
 import uuid
 from typing import List
-from fastapi import FastAPI, File, UploadFile, Depends, HTTPException, BackgroundTasks
+from fastapi import FastAPI, File, UploadFile, Depends, HTTPException, BackgroundTasks, Response
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from database import engine, SessionLocal, get_db
@@ -58,6 +58,48 @@ def get_document_status(document_id: str, db: Session = Depends(get_db)):
             } for e in entities
         ]
     }
+
+@app.get("/api/v1/documents/{document_id}/render/{page_number}")
+def render_document_page(document_id: str, page_number: int, db: Session = Depends(get_db)):
+    doc = db.query(models.Document).filter(models.Document.id == document_id).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    
+    if not os.path.exists(doc.file_path):
+        raise HTTPException(status_code=404, detail="File not found on disk")
+
+    try:
+        with fitz.open(doc.file_path) as pdf:
+            if page_number < 1 or page_number > len(pdf):
+                raise HTTPException(status_code=400, detail="Invalid page number")
+            
+            page = pdf[page_number - 1]
+            # Higher resolution pixmap
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+            img_data = pix.tobytes("png")
+            
+            # Return image with page dimensions as custom headers for scaling
+            return Response(
+                content=img_data, 
+                media_type="image/png",
+                headers={
+                    "X-Page-Width": str(page.rect.width),
+                    "X-Page-Height": str(page.rect.height),
+                    "Access-Control-Expose-Headers": "X-Page-Width, X-Page-Height"
+                }
+            )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error rendering page: {e}")
+
+@app.patch("/api/v1/entities/{entity_id}/dismiss")
+def dismiss_entity(entity_id: str, db: Session = Depends(get_db)):
+    entity = db.query(models.DetectedEntity).filter(models.DetectedEntity.id == entity_id).first()
+    if not entity:
+        raise HTTPException(status_code=404, detail="Entity not found")
+    
+    entity.is_dismissed = True
+    db.commit()
+    return {"status": "success"}
 
 @app.post("/api/v1/documents")
 async def upload_document(
