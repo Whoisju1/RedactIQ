@@ -6,8 +6,11 @@ services:
       - "127.0.0.1:8000:8000"
     volumes:
       - ./backend:/app
+      - ./temp_storage:/app/temp_storage
+      - /app/.venv
     environment:
       - PYTHONUNBUFFERED=1
+      - UV_LINK_MODE=copy
     command: uv run uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 
   frontend:

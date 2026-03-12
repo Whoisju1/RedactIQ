@@ -68,3 +68,4 @@ build/
 
 # Local tooling
 .cache/
+temp_storage/

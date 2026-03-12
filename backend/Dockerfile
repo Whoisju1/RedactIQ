@@ -18,8 +18,8 @@ COPY pyproject.toml .
 # Install dependencies using uv
 RUN uv sync --no-cache
 
-# Download the spaCy large model
-RUN uv run python -m spacy download en_core_web_lg
+# Download the spaCy large model directly via URL to avoid pip dependency issues
+RUN uv pip install https://github.com/explosion/spacy-models/releases/download/en_core_web_lg-3.7.1/en_core_web_lg-3.7.1-py3-none-any.whl
 
 # Copy application code
 COPY . .
