@@ -33,6 +33,13 @@ app.add_middleware(
 def health_check():
     return {"status": "ok"}
 
+from pydantic import BaseModel
+
+class ManualRedactionCreate(BaseModel):
+    type: str  # "TEXT" or "RECTANGLE"
+    page_number: int
+    bounding_box: dict
+
 @app.get("/api/v1/documents/{document_id}/status")
 def get_document_status(document_id: str, db: Session = Depends(get_db)):
     doc = db.query(models.Document).filter(models.Document.id == document_id).first()
@@ -40,6 +47,7 @@ def get_document_status(document_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Document not found")
     
     entities = db.query(models.DetectedEntity).filter(models.DetectedEntity.document_id == document_id).all()
+    redactions = db.query(models.ManualRedaction).filter(models.ManualRedaction.document_id == document_id).all()
     
     return {
         "id": doc.id,
@@ -56,7 +64,44 @@ def get_document_status(document_id: str, db: Session = Depends(get_db)):
                 "confidence": e.confidence,
                 "is_dismissed": e.is_dismissed
             } for e in entities
+        ],
+        "manual_redactions": [
+            {
+                "id": r.id,
+                "type": r.type.value if hasattr(r.type, 'value') else r.type,
+                "page_number": r.page_number,
+                "bounding_box": r.bounding_box
+            } for r in redactions
         ]
+    }
+
+@app.post("/api/v1/documents/{document_id}/redactions")
+def create_manual_redaction(document_id: str, redaction: ManualRedactionCreate, db: Session = Depends(get_db)):
+    doc = db.query(models.Document).filter(models.Document.id == document_id).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    
+    try:
+        r_type = models.RedactionType(redaction.type)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid redaction type")
+
+    db_redaction = models.ManualRedaction(
+        id=str(uuid.uuid4()),
+        document_id=doc.id,
+        type=r_type,
+        page_number=redaction.page_number,
+        bounding_box=redaction.bounding_box
+    )
+    db.add(db_redaction)
+    db.commit()
+    db.refresh(db_redaction)
+    
+    return {
+        "id": db_redaction.id,
+        "type": db_redaction.type.value if hasattr(db_redaction.type, 'value') else db_redaction.type,
+        "page_number": db_redaction.page_number,
+        "bounding_box": db_redaction.bounding_box
     }
 
 @app.get("/api/v1/documents/{document_id}/render/{page_number}")
@@ -98,6 +143,26 @@ def dismiss_entity(entity_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Entity not found")
     
     entity.is_dismissed = True
+    db.commit()
+    return {"status": "success"}
+
+@app.patch("/api/v1/entities/{entity_id}/restore")
+def restore_entity(entity_id: str, db: Session = Depends(get_db)):
+    entity = db.query(models.DetectedEntity).filter(models.DetectedEntity.id == entity_id).first()
+    if not entity:
+        raise HTTPException(status_code=404, detail="Entity not found")
+    
+    entity.is_dismissed = False
+    db.commit()
+    return {"status": "success"}
+
+@app.delete("/api/v1/redactions/{redaction_id}")
+def delete_manual_redaction(redaction_id: str, db: Session = Depends(get_db)):
+    redaction = db.query(models.ManualRedaction).filter(models.ManualRedaction.id == redaction_id).first()
+    if not redaction:
+        raise HTTPException(status_code=404, detail="Redaction not found")
+    
+    db.delete(redaction)
     db.commit()
     return {"status": "success"}
 
