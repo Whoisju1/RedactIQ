@@ -3,6 +3,7 @@ import shutil
 import uuid
 from typing import List
 from fastapi import FastAPI, File, UploadFile, Depends, HTTPException, BackgroundTasks, Response
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from database import engine, SessionLocal, get_db
@@ -136,6 +137,41 @@ def render_document_page(document_id: str, page_number: int, db: Session = Depen
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error rendering page: {e}")
 
+class DismissByTextRequest(BaseModel):
+    text_value: str
+
+@app.patch("/api/v1/documents/{document_id}/entities/dismiss-by-text")
+def dismiss_entities_by_text(document_id: str, request: DismissByTextRequest, db: Session = Depends(get_db)):
+    entities = db.query(models.DetectedEntity).filter(
+        models.DetectedEntity.document_id == document_id,
+        models.DetectedEntity.text_value == request.text_value
+    ).all()
+    
+    dismissed_ids = []
+    for entity in entities:
+        if not entity.is_dismissed:
+            entity.is_dismissed = True
+            dismissed_ids.append(entity.id)
+            
+    db.commit()
+    return {"status": "success", "dismissed_ids": dismissed_ids}
+
+@app.patch("/api/v1/documents/{document_id}/entities/restore-by-text")
+def restore_entities_by_text(document_id: str, request: DismissByTextRequest, db: Session = Depends(get_db)):
+    entities = db.query(models.DetectedEntity).filter(
+        models.DetectedEntity.document_id == document_id,
+        models.DetectedEntity.text_value == request.text_value
+    ).all()
+    
+    restored_ids = []
+    for entity in entities:
+        if entity.is_dismissed:
+            entity.is_dismissed = False
+            restored_ids.append(entity.id)
+            
+    db.commit()
+    return {"status": "success", "restored_ids": restored_ids}
+
 @app.patch("/api/v1/entities/{entity_id}/dismiss")
 def dismiss_entity(entity_id: str, db: Session = Depends(get_db)):
     entity = db.query(models.DetectedEntity).filter(models.DetectedEntity.id == entity_id).first()
@@ -165,6 +201,147 @@ def delete_manual_redaction(redaction_id: str, db: Session = Depends(get_db)):
     db.delete(redaction)
     db.commit()
     return {"status": "success"}
+
+def generate_redacted_pdf(doc_id: str, db: Session) -> str:
+    doc = db.query(models.Document).filter(models.Document.id == doc_id).first()
+    if not doc or not os.path.exists(doc.file_path):
+        raise ValueError("Document not found or file missing")
+
+    entities = db.query(models.DetectedEntity).filter(
+        models.DetectedEntity.document_id == doc_id,
+        models.DetectedEntity.is_dismissed == False
+    ).all()
+    
+    redactions = db.query(models.ManualRedaction).filter(
+        models.ManualRedaction.document_id == doc_id
+    ).all()
+
+    pdf = fitz.open(doc.file_path)
+    
+    for entity in entities:
+        if entity.page_number < 1 or entity.page_number > len(pdf):
+            continue
+        page = pdf[entity.page_number - 1]
+        rect = fitz.Rect(
+            entity.bounding_box['x1'],
+            entity.bounding_box['y1'],
+            entity.bounding_box['x2'],
+            entity.bounding_box['y2']
+        )
+        page.add_redact_annot(rect, fill=(0, 0, 0))
+        
+    for redaction in redactions:
+        if redaction.page_number < 1 or redaction.page_number > len(pdf):
+            continue
+        page = pdf[redaction.page_number - 1]
+        rect = fitz.Rect(
+            redaction.bounding_box['x1'],
+            redaction.bounding_box['y1'],
+            redaction.bounding_box['x2'],
+            redaction.bounding_box['y2']
+        )
+        page.add_redact_annot(rect, fill=(0, 0, 0))
+        
+    for page in pdf:
+        page.apply_redactions()
+        
+    redacted_file_path = os.path.join(TEMP_STORAGE_DIR, f"redacted_{doc.id}.pdf")
+    pdf.save(redacted_file_path, garbage=3, deflate=True)
+    pdf.close()
+    return redacted_file_path, doc.filename
+
+@app.get("/api/v1/documents/{document_id}/export")
+def export_redacted_document(document_id: str, db: Session = Depends(get_db)):
+    try:
+        redacted_file_path, original_filename = generate_redacted_pdf(document_id, db)
+        return FileResponse(
+            path=redacted_file_path, 
+            filename=f"redacted_{original_filename}", 
+            media_type="application/pdf"
+        )
+    except ValueError as ve:
+        raise HTTPException(status_code=404, detail=str(ve))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error exporting document: {e}")
+
+@app.post("/api/v1/batch/upload")
+async def upload_batch(
+    background_tasks: BackgroundTasks,
+    files: List[UploadFile] = File(...),
+    db: Session = Depends(get_db)
+):
+    doc_ids = []
+    allowed_extensions = {".pdf", ".docx", ".jpg", ".jpeg", ".png"}
+    
+    for file in files:
+        file_ext = os.path.splitext(file.filename)[1].lower()
+        if file_ext not in allowed_extensions:
+            continue
+        
+        doc_id = str(uuid.uuid4())
+        file_path = os.path.join(TEMP_STORAGE_DIR, f"{doc_id}{file_ext}")
+        
+        db_doc = models.Document(
+            id=doc_id,
+            filename=file.filename,
+            file_path=file_path,
+            status=models.DocumentStatus.QUEUED
+        )
+        db.add(db_doc)
+        
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+            
+        doc_ids.append(doc_id)
+        
+    db.commit()
+    
+    background_tasks.add_task(process_batch, doc_ids)
+    
+    return {"doc_ids": doc_ids}
+
+def process_batch(doc_ids: List[str]):
+    for doc_id in doc_ids:
+        # Mark as processing right before starting
+        db = SessionLocal()
+        doc = db.query(models.Document).filter(models.Document.id == doc_id).first()
+        if doc:
+            doc.status = models.DocumentStatus.PROCESSING
+            db.commit()
+        db.close()
+        
+        process_document_ingestion(doc_id)
+
+class BatchExportRequest(BaseModel):
+    doc_ids: List[str]
+
+import zipfile
+import io
+
+@app.post("/api/v1/batch/export")
+def export_batch(request: BatchExportRequest, db: Session = Depends(get_db)):
+    if not request.doc_ids:
+        raise HTTPException(status_code=400, detail="No document IDs provided")
+        
+    zip_filename = f"batch_export_{uuid.uuid4().hex[:8]}.zip"
+    zip_filepath = os.path.join(TEMP_STORAGE_DIR, zip_filename)
+    
+    try:
+        with zipfile.ZipFile(zip_filepath, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            for doc_id in request.doc_ids:
+                try:
+                    pdf_path, orig_name = generate_redacted_pdf(doc_id, db)
+                    zipf.write(pdf_path, f"redacted_{orig_name}")
+                except Exception as e:
+                    print(f"Skipping {doc_id} in batch export: {e}")
+                    
+        return FileResponse(
+            path=zip_filepath,
+            filename=zip_filename,
+            media_type="application/zip"
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error generating batch zip: {e}")
 
 @app.post("/api/v1/documents")
 async def upload_document(
@@ -229,6 +406,9 @@ def process_document_ingestion(doc_id: str):
                     # Analyze text for PII
                     analysis_results = analyzer.analyze_text(text=text)
                     
+                    # Track seen bounding boxes to prevent stacking overlapping rectangles
+                    seen_rects = set()
+                    
                     for result in analysis_results:
                         # Extract the actual text string for the entity
                         entity_text = text[result.start:result.end]
@@ -238,6 +418,12 @@ def process_document_ingestion(doc_id: str):
                         areas = page.search_for(entity_text)
                         
                         for rect in areas:
+                            # Round slightly to handle minor floating point differences
+                            rect_key = (round(rect.x0, 1), round(rect.y0, 1), round(rect.x1, 1), round(rect.y1, 1))
+                            if rect_key in seen_rects:
+                                continue
+                            seen_rects.add(rect_key)
+                            
                             # Save detected entity to DB
                             db_entity = models.DetectedEntity(
                                 id=str(uuid.uuid4()),

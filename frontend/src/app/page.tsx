@@ -41,10 +41,17 @@ interface FileStatus {
 
 type UndoAction = 
   | { type: 'add_redaction'; id: string }
-  | { type: 'dismiss_entity'; id: string };
+  | { type: 'dismiss_entity'; id: string }
+  | { type: 'dismiss_entities_by_text'; text_value: string; ids: string[] };
 
 export default function Home() {
+  // Single mode states
   const [fileStatus, setFileStatus] = useState<FileStatus | null>(null);
+  
+  // Batch mode states
+  const [isBatchMode, setIsBatchMode] = useState(false);
+  const [batchStatuses, setBatchStatuses] = useState<FileStatus[]>([]);
+
   const [isDragging, setIsDragging] = useState(false);
   const [viewMode, setViewMode] = useState<"upload" | "workspace">("upload");
   const [currentPage, setCurrentPage] = useState(1);
@@ -71,14 +78,14 @@ export default function Home() {
         const data = await response.json();
         setFileStatus(prev => prev ? { 
           ...prev, 
-          stage: data.status === "READY_FOR_REVIEW" ? "Complete" : "Analyzing",
-          progress: data.status === "READY_FOR_REVIEW" ? 100 : 66,
+          stage: data.status === "READY_FOR_REVIEW" ? "Complete" : (data.status === "ERROR" ? "Error" : "Analyzing"),
+          progress: data.status === "READY_FOR_REVIEW" ? 100 : (data.status === "ERROR" ? 0 : 66),
           entities: data.entities,
           manual_redactions: data.manual_redactions || [],
           page_count: data.page_count
         } : null);
 
-        if (data.status === "READY_FOR_REVIEW") {
+        if (data.status === "READY_FOR_REVIEW" || data.status === "ERROR") {
           return true; // Finished
         }
       }
@@ -128,17 +135,171 @@ export default function Home() {
     }
   };
 
-  const dismissEntity = async (entityId: string) => {
+  // --- BATCH LOGIC ---
+  const pollDocIds = (docIds: string[]) => {
+    const interval = setInterval(async () => {
+      let allFinished = true;
+      const updates = await Promise.all(docIds.map(async (docId) => {
+        try {
+          const response = await fetch(`http://localhost:8000/api/v1/documents/${docId}/status`);
+          if (response.ok) {
+             const data = await response.json();
+             if (data.status !== "READY_FOR_REVIEW" && data.status !== "ERROR") {
+               allFinished = false;
+             }
+             return {
+               id: docId,
+               name: data.filename,
+               size: "Batch Item",
+               stage: data.status === "READY_FOR_REVIEW" ? "Complete" : (data.status === "ERROR" ? "Error" : "Analyzing"),
+               progress: data.status === "READY_FOR_REVIEW" ? 100 : (data.status === "ERROR" ? 0 : 50)
+             } as FileStatus;
+          }
+        } catch (e) {
+          console.error(e);
+        }
+        allFinished = false;
+        return null;
+      }));
+
+      setBatchStatuses(prev => {
+        const copy = [...prev];
+        updates.forEach(update => {
+          if (update) {
+            const idx = copy.findIndex(s => s.id === update.id);
+            if (idx !== -1) {
+              copy[idx] = update;
+            }
+          }
+        });
+        return copy;
+      });
+
+      if (allFinished) {
+        clearInterval(interval);
+      }
+    }, 2000);
+  };
+
+  const handleBatchUpload = async (files: FileList | File[]) => {
+    const formData = new FormData();
+    for (let i = 0; i < files.length; i++) {
+      formData.append("files", files[i]);
+    }
+    
+    const tempIds = Array.from(files).map((_, i) => `temp-${Date.now()}-${i}`);
+    
+    const newStatuses = Array.from(files).map((f, i) => ({
+      id: tempIds[i],
+      name: f.name,
+      size: "Batch Item",
+      stage: "Uploading" as ProcessingStage,
+      progress: 10
+    }));
+
+    setBatchStatuses(prev => [...prev, ...newStatuses]);
+
     try {
-      const response = await fetch(`http://localhost:8000/api/v1/entities/${entityId}/dismiss`, {
+      const response = await fetch("http://localhost:8000/api/v1/batch/upload", {
+        method: "POST",
+        body: formData,
+      });
+      if (!response.ok) throw new Error("Batch upload failed");
+      const data = await response.json();
+      const docIds = data.doc_ids as string[];
+
+      // Swap temp IDs with real document IDs
+      setBatchStatuses(prev => {
+        const copy = [...prev];
+        tempIds.forEach((tempId, index) => {
+          const idx = copy.findIndex(s => s.id === tempId);
+          if (idx !== -1) {
+            copy[idx] = { ...copy[idx], id: docIds[index], stage: "Analyzing", progress: 50 };
+          }
+        });
+        return copy;
+      });
+
+      pollDocIds(docIds);
+    } catch (error) {
+      console.error(error);
+      setBatchStatuses(prev => prev.map(s => tempIds.includes(s.id) ? { ...s, stage: "Error", progress: 0 } : s));
+    }
+  };
+
+  const handleBatchExport = async () => {
+    if (batchStatuses.length === 0) return;
+    try {
+      const response = await fetch("http://localhost:8000/api/v1/batch/export", {
+         method: "POST",
+         headers: { "Content-Type": "application/json" },
+         body: JSON.stringify({ doc_ids: batchStatuses.filter(s => s.stage === 'Complete').map(s => s.id) })
+      });
+      if (!response.ok) throw new Error("Batch export failed");
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `batch_export.zip`;
+      document.body.appendChild(a);
+      a.click();
+      window.URL.revokeObjectURL(url);
+      document.body.removeChild(a);
+    } catch(err) {
+       console.error(err);
+       alert("Failed to export batch.");
+    }
+  };
+
+  const onDrop = (e: React.DragEvent) => {
+    e.preventDefault(); 
+    setIsDragging(false); 
+    const files = e.dataTransfer.files; 
+    if (files.length > 0) {
+      if (isBatchMode) {
+        handleBatchUpload(files);
+      } else {
+        handleFileUpload(files[0]);
+      }
+    } 
+  };
+
+  const dismissEntity = async (entity: DetectedEntity, e: React.MouseEvent) => {
+    if ((e.ctrlKey || e.metaKey) && fileStatus) {
+      const confirmDismiss = window.confirm(`Do you want to remove all automatic redactions for "${entity.text_value}"?`);
+      if (confirmDismiss) {
+        try {
+          const response = await fetch(`http://localhost:8000/api/v1/documents/${fileStatus.id}/entities/dismiss-by-text`, {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ text_value: entity.text_value })
+          });
+          if (response.ok) {
+            const data = await response.json();
+            const dismissedIds = data.dismissed_ids as string[];
+            setFileStatus(prev => prev ? {
+              ...prev,
+              entities: prev.entities?.map(ent => dismissedIds.includes(ent.id) ? { ...ent, is_dismissed: true } : ent)
+            } : null);
+            setUndoStack(prev => [...prev, { type: 'dismiss_entities_by_text', text_value: entity.text_value, ids: dismissedIds }]);
+          }
+        } catch (error) {
+          console.error("Error batch dismissing entities:", error);
+        }
+      }
+      return;
+    }
+
+    try {
+      const response = await fetch(`http://localhost:8000/api/v1/entities/${entity.id}/dismiss`, {
         method: "PATCH",
       });
       if (response.ok && fileStatus) {
         setFileStatus({
           ...fileStatus,
-          entities: fileStatus.entities?.map(e => e.id === entityId ? { ...e, is_dismissed: true } : e)
+          entities: fileStatus.entities?.map(ent => ent.id === entity.id ? { ...ent, is_dismissed: true } : ent)
         });
-        setUndoStack(prev => [...prev, { type: 'dismiss_entity', id: entityId }]);
+        setUndoStack(prev => [...prev, { type: 'dismiss_entity', id: entity.id }]);
       }
     } catch (error) {
       console.error("Error dismissing entity:", error);
@@ -155,7 +316,6 @@ export default function Home() {
           ...fileStatus,
           manual_redactions: fileStatus.manual_redactions?.filter(r => r.id !== redactionId)
         });
-        // Remove it from the undo stack if it exists
         setUndoStack(prev => prev.filter(action => !(action.type === 'add_redaction' && action.id === redactionId)));
       }
     } catch (error) {
@@ -187,6 +347,18 @@ export default function Home() {
             entities: prev.entities?.map(e => e.id === lastAction.id ? { ...e, is_dismissed: false } : e)
           } : null);
         }
+      } else if (lastAction.type === 'dismiss_entities_by_text') {
+        const response = await fetch(`http://localhost:8000/api/v1/documents/${fileStatus.id}/entities/restore-by-text`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text_value: lastAction.text_value })
+        });
+        if (response.ok) {
+          setFileStatus(prev => prev ? {
+            ...prev,
+            entities: prev.entities?.map(e => lastAction.ids.includes(e.id) ? { ...e, is_dismissed: false } : e)
+          } : null);
+        }
       }
       setUndoStack(newStack);
     } catch (error) {
@@ -196,14 +368,11 @@ export default function Home() {
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      // Cancel drawing on Escape unconditionally
       if (e.key === 'Escape') {
         setIsDrawing(false);
         setDrawStart(null);
         setCurrentRect(null);
       }
-      
-      // Check for Ctrl+Z or Cmd+Z
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
         e.preventDefault();
         undoLastAction();
@@ -262,7 +431,7 @@ export default function Home() {
     
     let y2 = coords.y;
     if (activeTool === "select") {
-       y2 = drawStart.y + 12; // Simulate a fixed height for text selection
+       y2 = drawStart.y + 12;
     }
 
     setCurrentRect({
@@ -288,7 +457,6 @@ export default function Home() {
     setDrawStart(null);
     setCurrentRect(null);
 
-    // Filter out accidental clicks
     if (Math.abs(boundingBox.x2 - boundingBox.x1) < 5) return;
 
     try {
@@ -315,7 +483,28 @@ export default function Home() {
     }
   };
 
-  if (viewMode === "workspace" && fileStatus) {
+  const handleExport = async () => {
+    if (!fileStatus) return;
+    try {
+      const response = await fetch(`http://localhost:8000/api/v1/documents/${fileStatus.id}/export`);
+      if (!response.ok) throw new Error("Export failed");
+      
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `redacted_${fileStatus.name}`;
+      document.body.appendChild(a);
+      a.click();
+      window.URL.revokeObjectURL(url);
+      document.body.removeChild(a);
+    } catch (error) {
+      console.error("Error exporting document:", error);
+      alert("Failed to export document. Please try again.");
+    }
+  };
+
+  if (viewMode === "workspace" && fileStatus && !isBatchMode) {
     const activeEntities = fileStatus.entities?.filter(e => e.page_number === currentPage && !e.is_dismissed && !hiddenTypes.has(e.entity_type)) || [];
     const activeRedactions = fileStatus.manual_redactions?.filter(r => r.page_number === currentPage) || [];
     
@@ -378,7 +567,10 @@ export default function Home() {
                 &rarr;
               </button>
             </div>
-            <button className="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded-lg font-medium transition-colors">
+            <button 
+              onClick={handleExport}
+              className="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded-lg font-medium transition-colors"
+            >
               Export Redacted
             </button>
           </div>
@@ -445,9 +637,9 @@ export default function Home() {
                     }}
                   >
                     <button
-                      onClick={() => dismissEntity(entity.id)}
+                      onClick={(e) => dismissEntity(entity, e)}
                       className="absolute -top-2 -right-2 bg-red-600 text-white rounded-full w-5 h-5 flex items-center justify-center text-[10px] opacity-0 group-hover:opacity-100 transition-opacity shadow-lg"
-                      title="Dismiss"
+                      title="Dismiss (Ctrl+Click to dismiss all matching text)"
                     >
                       &times;
                     </button>
@@ -505,10 +697,22 @@ export default function Home() {
       </header>
 
       <main className="w-full max-w-2xl">
+        <div className="mb-6 flex justify-end">
+          <label className="flex items-center space-x-2 cursor-pointer bg-white px-4 py-2 rounded-lg shadow-sm border border-gray-200 hover:bg-gray-50 transition-colors">
+            <input 
+              type="checkbox" 
+              checked={isBatchMode}
+              onChange={(e) => setIsBatchMode(e.target.checked)}
+              className="w-4 h-4 rounded text-blue-600 border-gray-300 focus:ring-blue-500"
+            />
+            <span className="text-sm font-medium text-gray-700">Batch Processing Mode</span>
+          </label>
+        </div>
+
         <div
           onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
           onDragLeave={() => setIsDragging(false)}
-          onDrop={(e) => { e.preventDefault(); setIsDragging(false); const files = e.dataTransfer.files; if (files.length > 0) handleFileUpload(files[0]); }}
+          onDrop={onDrop}
           className={`
             relative border-2 border-dashed rounded-xl p-12 text-center transition-all
             ${isDragging ? "border-blue-500 bg-blue-50 scale-[1.02]" : "border-gray-300 bg-white hover:border-gray-400"}
@@ -516,7 +720,19 @@ export default function Home() {
         >
           <input
             type="file"
-            onChange={(e) => { const files = e.target.files; if (files && files.length > 0) handleFileUpload(files[0]); }}
+            multiple
+            onChange={(e) => {
+              const files = e.target.files;
+              if (files && files.length > 0) {
+                if (isBatchMode) {
+                  handleBatchUpload(files);
+                } else {
+                  handleFileUpload(files[0]);
+                }
+              }
+              // Reset value so same file can be selected again if needed
+              e.target.value = '';
+            }}
             className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
             accept=".pdf,.jpg,.jpeg,.png"
           />
@@ -524,7 +740,9 @@ export default function Home() {
             <svg className="w-12 h-12 text-gray-400 mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
             </svg>
-            <p className="text-lg font-medium text-gray-700">Drag & drop files here</p>
+            <p className="text-lg font-medium text-gray-700">
+              {isBatchMode ? "Drag & drop multiple files here" : "Drag & drop a file here"}
+            </p>
             <p className="text-sm text-gray-500 mt-1">PDF, JPG, or PNG</p>
             <button className="mt-6 px-6 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors font-medium">
               Browse Files
@@ -532,7 +750,7 @@ export default function Home() {
           </div>
         </div>
 
-        {fileStatus && (
+        {!isBatchMode && fileStatus && (
           <div className="mt-8 bg-white rounded-xl shadow-sm border border-gray-100 p-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
             <div className="flex items-start justify-between mb-4">
               <div className="flex items-center">
@@ -576,13 +794,55 @@ export default function Home() {
                   `}
                 ></div>
               </div>
-              <div className="flex justify-between text-xs text-gray-500">
-                <span>{fileStatus.progress}% Complete</span>
-                <span>{fileStatus.stage === "Complete" ? "Ready for review" : "Processing..."}</span>
-              </div>
             </div>
           </div>
         )}
+
+        {isBatchMode && batchStatuses.length > 0 && (
+          <div className="mt-8 bg-white rounded-xl shadow-sm border border-gray-100 p-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
+            <div className="flex items-center justify-between mb-6">
+              <h2 className="text-lg font-bold text-gray-900">Batch Processing Dashboard</h2>
+              {batchStatuses.every(s => s.stage === 'Complete' || s.stage === 'Error') && (
+                <button 
+                  onClick={handleBatchExport}
+                  className="bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded-lg font-medium transition-colors shadow-sm"
+                >
+                  Download Batch ZIP
+                </button>
+              )}
+            </div>
+
+            <div className="space-y-4 max-h-[400px] overflow-y-auto pr-2">
+              {batchStatuses.map(status => (
+                <div key={status.id} className="p-4 border border-gray-100 rounded-lg bg-gray-50/50">
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="font-medium text-gray-900 truncate max-w-[200px]">{status.name}</span>
+                    <span className={`
+                      text-[10px] font-bold px-2 py-0.5 rounded-full uppercase
+                      ${status.stage === "Complete" ? "bg-green-100 text-green-700" : 
+                        status.stage === "Error" ? "bg-red-100 text-red-700" : "bg-blue-100 text-blue-700"}
+                    `}>
+                      {status.stage}
+                    </span>
+                  </div>
+                  <div className="relative pt-1">
+                    <div className="overflow-hidden h-1.5 text-xs flex rounded bg-gray-200">
+                      <div
+                        style={{ width: `${status.progress}%` }}
+                        className={`
+                          shadow-none flex flex-col text-center whitespace-nowrap text-white justify-center transition-all duration-500
+                          ${status.stage === "Complete" ? "bg-green-500" : 
+                            status.stage === "Error" ? "bg-red-500" : "bg-blue-500"}
+                        `}
+                      ></div>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
       </main>
     </div>
   );
