@@ -9,6 +9,7 @@ from database import engine, SessionLocal, get_db
 import models
 import fitz  # PyMuPDF
 from engines.ocr import OCREngineWrapper
+from engines.analyzer import AnalyzerEngineWrapper
 
 # Ensure tables exist
 models.Base.metadata.create_all(bind=engine)
@@ -31,6 +32,32 @@ app.add_middleware(
 @app.get("/api/health")
 def health_check():
     return {"status": "ok"}
+
+@app.get("/api/v1/documents/{document_id}/status")
+def get_document_status(document_id: str, db: Session = Depends(get_db)):
+    doc = db.query(models.Document).filter(models.Document.id == document_id).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    
+    entities = db.query(models.DetectedEntity).filter(models.DetectedEntity.document_id == document_id).all()
+    
+    return {
+        "id": doc.id,
+        "filename": doc.filename,
+        "status": doc.status,
+        "page_count": doc.page_count,
+        "entities": [
+            {
+                "id": e.id,
+                "entity_type": e.entity_type,
+                "text_value": e.text_value,
+                "page_number": e.page_number,
+                "bounding_box": e.bounding_box,
+                "confidence": e.confidence,
+                "is_dismissed": e.is_dismissed
+            } for e in entities
+        ]
+    }
 
 @app.post("/api/v1/documents")
 async def upload_document(
@@ -72,36 +99,56 @@ async def upload_document(
     }
 
 def process_document_ingestion(doc_id: str):
-    # This would normally be in a separate worker, but for MVP we use background tasks
     db = SessionLocal()
+    analyzer = AnalyzerEngineWrapper()
     try:
         doc = db.query(models.Document).filter(models.Document.id == doc_id).first()
         if not doc:
             return
 
         file_ext = os.path.splitext(doc.file_path)[1].lower()
-        
-        has_text = False
         page_count = 0
 
         if file_ext == ".pdf":
-            # Check for text layer using PyMuPDF
             with fitz.open(doc.file_path) as pdf:
                 page_count = len(pdf)
-                for page in pdf:
-                    if page.get_text().strip():
-                        has_text = True
-                        break
-        
-        doc.page_count = page_count
-        
-        # If it's an image or scanned PDF without text, we'd eventually run OCR
-        if not has_text and file_ext in [".jpg", ".jpeg", ".png", ".pdf"]:
-            # Route to OCR Engine if needed (simulated for now or calling wrapper)
-            # ocr_engine = OCREngineWrapper()
-            # text = ocr_engine.extract_text(doc.file_path)
-            pass
+                doc.page_count = page_count
+                
+                for page_num, page in enumerate(pdf):
+                    text = page.get_text()
+                    if not text.strip():
+                        continue
+                    
+                    # Analyze text for PII
+                    analysis_results = analyzer.analyze_text(text=text)
+                    
+                    for result in analysis_results:
+                        # Extract the actual text string for the entity
+                        entity_text = text[result.start:result.end]
+                        
+                        # Find bounding boxes for this text on the page
+                        # Note: search_for returns a list of Rects
+                        areas = page.search_for(entity_text)
+                        
+                        for rect in areas:
+                            # Save detected entity to DB
+                            db_entity = models.DetectedEntity(
+                                id=str(uuid.uuid4()),
+                                document_id=doc.id,
+                                entity_type=result.entity_type,
+                                text_value=entity_text,
+                                page_number=page_num + 1,
+                                bounding_box={
+                                    "x1": rect.x0,
+                                    "y1": rect.y0,
+                                    "x2": rect.x1,
+                                    "y2": rect.y1
+                                },
+                                confidence=result.score
+                            )
+                            db.add(db_entity)
 
+        # Update status to READY_FOR_REVIEW
         doc.status = models.DocumentStatus.READY_FOR_REVIEW
         db.commit()
     except Exception as e:
